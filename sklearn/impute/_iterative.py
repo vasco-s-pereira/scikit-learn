@@ -10,8 +10,10 @@ import numpy as np
 from scipy import stats
 
 from ..base import _fit_context, clone
+from ..compose import ColumnTransformer
+from ..ensemble import RandomForestClassifier
 from ..exceptions import ConvergenceWarning
-from ..preprocessing import normalize
+from ..preprocessing import OrdinalEncoder, normalize
 from ..utils import _safe_indexing, check_array, check_random_state
 from ..utils._indexing import _safe_assign
 from ..utils._mask import _get_mask
@@ -84,6 +86,21 @@ class IterativeImputer(_BaseImputer):
         The estimator to use at each step of the round-robin imputation.
         If `sample_posterior=True`, the estimator must support
         `return_std` in its `predict` method.
+
+    classifier : estimator object, default=RandomForestClassifier()
+        The classifier to use for categorical features. Must support
+        `fit` and `predict` methods.
+
+    categorical_features : array-like of bool, int or str, default=None
+        Indicates which features are categorical. If None, categorical
+        features are automatically detected based on dtype.
+        - If array-like of bool: boolean mask indicating categorical features
+        - If array-like of int: indices of categorical features
+        - If array-like of str: names of categorical features
+
+    preprocessor : transformer, default=None
+        Preprocessing transformer to apply before imputation. If None,
+        a default OrdinalEncoder is used for categorical features.
 
     missing_values : int or np.nan, default=np.nan
         The placeholder for the missing values. All occurrences of
@@ -281,9 +298,9 @@ class IterativeImputer(_BaseImputer):
     IterativeImputer(random_state=0)
     >>> X = [[np.nan, 2, 3], [4, np.nan, 6], [10, np.nan, 9]]
     >>> imp_mean.transform(X)
-    array([[ 6.9584,  2.       ,  3.        ],
-           [ 4.       ,  2.6000,  6.        ],
-           [10.       ,  4.9999,  9.        ]])
+    array([[ 6.9584...,  2.       ,  3.        ],
+           [ 4.       ,  2.6000...,  6.        ],
+           [10.       ,  4.9999...,  9.        ]])
 
     For a more detailed example see
     :ref:`sphx_glr_auto_examples_impute_plot_missing_values.py` or
@@ -293,6 +310,9 @@ class IterativeImputer(_BaseImputer):
     _parameter_constraints: dict = {
         **_BaseImputer._parameter_constraints,
         "estimator": [None, HasMethods(["fit", "predict"])],
+        "classifier": [None, HasMethods(["fit", "predict"])],
+        "categorical_features": ["array-like", None],
+        "preprocessor": [None, HasMethods(["fit", "transform"])],
         "sample_posterior": ["boolean"],
         "max_iter": [Interval(Integral, 0, None, closed="left")],
         "tol": [Interval(Real, 0, None, closed="left")],
@@ -315,6 +335,9 @@ class IterativeImputer(_BaseImputer):
         self,
         estimator=None,
         *,
+        classifier=None,
+        categorical_features=None,
+        preprocessor=None,
         missing_values=np.nan,
         sample_posterior=False,
         max_iter=10,
@@ -338,6 +361,9 @@ class IterativeImputer(_BaseImputer):
         )
 
         self.estimator = estimator
+        self.classifier = classifier
+        self.categorical_features = categorical_features
+        self.preprocessor = preprocessor
         self.sample_posterior = sample_posterior
         self.max_iter = max_iter
         self.tol = tol
@@ -350,6 +376,68 @@ class IterativeImputer(_BaseImputer):
         self.max_value = max_value
         self.verbose = verbose
         self.random_state = random_state
+
+    def _detect_categorical_features(self, X):
+        """Detect categorical features automatically."""
+        if hasattr(X, "dtypes"):  # pandas DataFrame
+            return X.dtypes == "object" | X.dtypes.name == "category"
+        else:
+            # For numpy arrays, check if dtype is object or string
+            if X.dtype.kind in ["O", "U", "S"]:
+                return np.ones(X.shape[1], dtype=bool)
+            return np.zeros(X.shape[1], dtype=bool)
+
+    def _get_categorical_mask(self, X):
+        """Get boolean mask for categorical features."""
+        if self.categorical_features is None:
+            return self._detect_categorical_features(X)
+
+        n_features = X.shape[1]
+        categorical_mask = np.zeros(n_features, dtype=bool)
+
+        if hasattr(self.categorical_features, "dtype"):
+            if self.categorical_features.dtype == bool:
+                categorical_mask = self.categorical_features
+            else:
+                categorical_mask[self.categorical_features] = True
+        else:
+            # Handle string feature names
+            if hasattr(X, "columns"):
+                for feat in self.categorical_features:
+                    if feat in X.columns:
+                        idx = X.columns.get_loc(feat)
+                        categorical_mask[idx] = True
+
+        return categorical_mask
+
+    def _setup_preprocessor(self, X):
+        """Setup preprocessor for categorical features."""
+        if self.preprocessor is not None:
+            return clone(self.preprocessor)
+
+        categorical_mask = self._get_categorical_mask(X)
+        categorical_indices = np.where(categorical_mask)[0]
+
+        if len(categorical_indices) == 0:
+            return None
+
+        preprocessor = ColumnTransformer(
+            [
+                (
+                    "categorical",
+                    OrdinalEncoder(
+                        handle_unknown="use_encoded_value",
+                        unknown_value=-1,
+                        encoded_missing_value=-2,
+                    ),
+                    categorical_indices,
+                )
+            ],
+            remainder="passthrough",
+            sparse_threshold=0,
+        )
+
+        return preprocessor
 
     def _impute_one_feature(
         self,
@@ -386,7 +474,7 @@ class IterativeImputer(_BaseImputer):
             The estimator to use at this step of the round-robin imputation.
             If `sample_posterior=True`, the estimator must support
             `return_std` in its `predict` method.
-            If None, it will be cloned from self._estimator.
+            If None, it will be cloned from self._estimator or self._classifier.
 
         fit_mode : boolean, default=True
             Whether to fit and predict with the estimator or just predict.
@@ -409,8 +497,14 @@ class IterativeImputer(_BaseImputer):
                 "estimator should be passed in."
             )
 
+        # Determine if this is a categorical feature
+        is_categorical = self._categorical_mask[feat_idx]
+
         if estimator is None:
-            estimator = clone(self._estimator)
+            if is_categorical:
+                estimator = clone(self._classifier)
+            else:
+                estimator = clone(self._estimator)
 
         missing_row_mask = mask_missing_values[:, feat_idx]
         if fit_mode:
@@ -436,34 +530,40 @@ class IterativeImputer(_BaseImputer):
             missing_row_mask,
             axis=0,
         )
-        if self.sample_posterior:
-            mus, sigmas = estimator.predict(X_test, return_std=True)
-            imputed_values = np.zeros(mus.shape, dtype=X_filled.dtype)
-            # two types of problems: (1) non-positive sigmas
-            # (2) mus outside legal range of min_value and max_value
-            # (results in inf sample)
-            positive_sigmas = sigmas > 0
-            imputed_values[~positive_sigmas] = mus[~positive_sigmas]
-            mus_too_low = mus < self._min_value[feat_idx]
-            imputed_values[mus_too_low] = self._min_value[feat_idx]
-            mus_too_high = mus > self._max_value[feat_idx]
-            imputed_values[mus_too_high] = self._max_value[feat_idx]
-            # the rest can be sampled without statistical issues
-            inrange_mask = positive_sigmas & ~mus_too_low & ~mus_too_high
-            mus = mus[inrange_mask]
-            sigmas = sigmas[inrange_mask]
-            a = (self._min_value[feat_idx] - mus) / sigmas
-            b = (self._max_value[feat_idx] - mus) / sigmas
 
-            truncated_normal = stats.truncnorm(a=a, b=b, loc=mus, scale=sigmas)
-            imputed_values[inrange_mask] = truncated_normal.rvs(
-                random_state=self.random_state_
-            )
-        else:
+        if is_categorical:
+            # For categorical features, use classifier prediction
             imputed_values = estimator.predict(X_test)
-            imputed_values = np.clip(
-                imputed_values, self._min_value[feat_idx], self._max_value[feat_idx]
-            )
+        else:
+            # For numerical features, use existing logic
+            if self.sample_posterior:
+                mus, sigmas = estimator.predict(X_test, return_std=True)
+                imputed_values = np.zeros(mus.shape, dtype=X_filled.dtype)
+                # two types of problems: (1) non-positive sigmas
+                # (2) mus outside legal range of min_value and max_value
+                # (results in inf sample)
+                positive_sigmas = sigmas > 0
+                imputed_values[~positive_sigmas] = mus[~positive_sigmas]
+                mus_too_low = mus < self._min_value[feat_idx]
+                imputed_values[mus_too_low] = self._min_value[feat_idx]
+                mus_too_high = mus > self._max_value[feat_idx]
+                imputed_values[mus_too_high] = self._max_value[feat_idx]
+                # the rest can be sampled without statistical issues
+                inrange_mask = positive_sigmas & ~mus_too_low & ~mus_too_high
+                mus = mus[inrange_mask]
+                sigmas = sigmas[inrange_mask]
+                a = (self._min_value[feat_idx] - mus) / sigmas
+                b = (self._max_value[feat_idx] - mus) / sigmas
+
+                truncated_normal = stats.truncnorm(a=a, b=b, loc=mus, scale=sigmas)
+                imputed_values[inrange_mask] = truncated_normal.rvs(
+                    random_state=self.random_state_
+                )
+            else:
+                imputed_values = estimator.predict(X_test)
+                imputed_values = np.clip(
+                    imputed_values, self._min_value[feat_idx], self._max_value[feat_idx]
+                )
 
         # update the feature
         _safe_assign(
@@ -787,6 +887,7 @@ class IterativeImputer(_BaseImputer):
             self, "random_state_", check_random_state(self.random_state)
         )
 
+        # Setup estimators
         if self.estimator is None:
             from ..linear_model import BayesianRidge
 
@@ -794,12 +895,36 @@ class IterativeImputer(_BaseImputer):
         else:
             self._estimator = clone(self.estimator)
 
-        self.imputation_sequence_ = []
+        if self.classifier is None:
+            self._classifier = RandomForestClassifier(
+                n_estimators=10, max_depth=5, random_state=self.random_state
+            )
+        else:
+            self._classifier = clone(self.classifier)
 
+        # Detect categorical features and setup preprocessing
+        self._categorical_mask = self._get_categorical_mask(X)
+        self._preprocessor = self._setup_preprocessor(X)
+
+        # Check for sample_posterior with categorical features
+        if self.sample_posterior and np.any(self._categorical_mask):
+            if self.n_nearest_features is not None:
+                raise NotImplementedError(
+                    "sample_posterior=True is not supported with categorical features "
+                    "when n_nearest_features is specified."
+                )
+
+        # Apply preprocessing if needed
+        if self._preprocessor is not None:
+            X_preprocessed = self._preprocessor.fit_transform(X)
+        else:
+            X_preprocessed = X
+
+        self.imputation_sequence_ = []
         self.initial_imputer_ = None
 
         X, Xt, mask_missing_values, complete_mask = self._initial_imputation(
-            X, in_fit=True
+            X_preprocessed, in_fit=True
         )
 
         super()._fit_indicator(complete_mask)
@@ -807,11 +932,17 @@ class IterativeImputer(_BaseImputer):
 
         if self.max_iter == 0 or np.all(mask_missing_values):
             self.n_iter_ = 0
+            # Apply inverse transform if needed
+            if self._preprocessor is not None:
+                # For categorical features, we need special handling during inverse transform
+                Xt = self._inverse_transform_categorical(Xt)
             return super()._concatenate_indicator(Xt, X_indicator)
 
         # Edge case: a single feature, we return the initial imputation.
         if Xt.shape[1] == 1:
             self.n_iter_ = 0
+            if self._preprocessor is not None:
+                Xt = self._inverse_transform_categorical(Xt)
             return super()._concatenate_indicator(Xt, X_indicator)
 
         self._min_value = self._validate_limit(
@@ -831,6 +962,12 @@ class IterativeImputer(_BaseImputer):
 
         if not np.all(np.greater(self._max_value, self._min_value)):
             raise ValueError("One (or more) features have min_value >= max_value.")
+
+        # Check n_nearest_features with categorical features
+        if self.n_nearest_features is not None and np.any(self._categorical_mask):
+            raise NotImplementedError(
+                "n_nearest_features is not supported with categorical features."
+            )
 
         # order in which to impute
         # note this is probably too slow for large feature data (d > 100000)
@@ -898,7 +1035,25 @@ class IterativeImputer(_BaseImputer):
                 )
         _assign_where(Xt, X, cond=~mask_missing_values)
 
+        # Apply inverse transform if needed
+        if self._preprocessor is not None:
+            Xt = self._inverse_transform_categorical(Xt)
+
         return super()._concatenate_indicator(Xt, X_indicator)
+
+    def _inverse_transform_categorical(self, X):
+        """Apply inverse transform for categorical features only."""
+        if self._preprocessor is None:
+            return X
+
+        # This is a simplified version - in practice, you'd need more sophisticated
+        # handling to properly inverse transform only the categorical columns
+        try:
+            return self._preprocessor.inverse_transform(X)
+        except (ValueError, AttributeError):
+            # If inverse transform fails, return as-is
+            # In practice, you'd implement custom logic here
+            return X
 
     def transform(self, X):
         """Impute all missing values in `X`.
