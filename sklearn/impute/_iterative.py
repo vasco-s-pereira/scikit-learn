@@ -395,19 +395,86 @@ class IterativeImputer(_BaseImputer):
         n_features = X.shape[1]
         categorical_mask = np.zeros(n_features, dtype=bool)
 
+        # Case 1: categorical_features is a numpy array
         if hasattr(self.categorical_features, "dtype"):
-            if self.categorical_features.dtype == bool:
-                categorical_mask = self.categorical_features
-            else:
-                categorical_mask[self.categorical_features] = True
+            if self.categorical_features.dtype == bool:  # Subcase 1.1: Boolean mask
+                if len(self.categorical_features) == n_features:
+                    categorical_mask = np.asarray(self.categorical_features)
+                else:
+                    raise ValueError(
+                        f"Boolean mask for categorical_features has length "
+                        f"{len(self.categorical_features)},"
+                        f"but data has {n_features} features."
+                    )
+            elif np.issubdtype(self.categorical_features.dtype, np.integer):
+                # Subcase 1.2: Integer indices
+                try:
+                    cf_array = np.asarray(self.categorical_features)
+                    if np.any(cf_array < 0) or np.any(cf_array >= n_features):
+                        raise IndexError(
+                            f"Categorical feature indices are out "
+                            f"of bounds for {n_features} features."
+                        )
+                    categorical_mask[cf_array] = True
+                except IndexError as e:
+                    raise ValueError(
+                        f"Invalid integer indices in"
+                        f" numpy array categorical_features: {e}"
+                    )
+            else:  # Numpy array of other dtype
+                raise ValueError(
+                    "If categorical_features is a numpy array, "
+                    "its dtype must be bool or integer. "
+                    f"Got dtype: {self.categorical_features.dtype}"
+                )
+        # Case 2: categorical_features is a list or tuple
+        elif isinstance(self.categorical_features, (list, tuple)):
+            if not self.categorical_features:  # Empty list/tuple
+                pass  # categorical_mask remains all False, which is correct
+            elif all(isinstance(idx, Integral) for idx in self.categorical_features):
+                # Subcase 2.1: List/tuple of integer indices
+                try:
+                    cf_array = np.asarray(self.categorical_features)
+                    if np.any(cf_array < 0) or np.any(cf_array >= n_features):
+                        raise IndexError(
+                            f"Categorical feature indices are"
+                            f"out of bounds for {n_features} features."
+                        )
+                    categorical_mask[cf_array] = True
+                except IndexError as e:
+                    raise ValueError(
+                        f"Invalid integer indices in"
+                        f"list/tuple categorical_features: {e}"
+                    )
+            elif hasattr(X, "columns") and all(
+                isinstance(name, str) for name in self.categorical_features
+            ):  # Subcase 2.2: List/tuple of string names (X must be DataFrame)
+                feature_names_map = {name: i for i, name in enumerate(X.columns)}
+                indices_to_set = []
+                for feat_name in self.categorical_features:
+                    if feat_name not in feature_names_map:
+                        raise ValueError(
+                            f"Feature name '{feat_name}' in categorical_features "
+                            "not found in input data columns."
+                        )
+                    indices_to_set.append(feature_names_map[feat_name])
+                categorical_mask[indices_to_set] = True
+            else:  # List/tuple of mixed types or strings when X is not DataFrame
+                raise ValueError(
+                    "If categorical_features is a list/tuple, "
+                    "it must contain all integers (indices), "
+                    "or (if X is a DataFrame and features are strings) "
+                    "all strings (feature names). "
+                    f"Got: {self.categorical_features}"
+                )
+        # Case 3: Unrecognized format for categorical_features
         else:
-            # Handle string feature names
-            if hasattr(X, "columns"):
-                for feat in self.categorical_features:
-                    if feat in X.columns:
-                        idx = X.columns.get_loc(feat)
-                        categorical_mask[idx] = True
-
+            raise ValueError(
+                "categorical_features must be None, a numpy"
+                "array (bool or int), or a list/tuple "
+                "(of int or str). "
+                f"Got: {type(self.categorical_features)}"
+            )
         return categorical_mask
 
     def _setup_preprocessor(self, X):
@@ -518,6 +585,11 @@ class IterativeImputer(_BaseImputer):
                 ~missing_row_mask,
                 axis=0,
             )
+
+            # For categorical features, ensure y_train contains integer labels
+            if is_categorical:
+                y_train = y_train.astype(int)
+
             estimator.fit(X_train, y_train, **params)
 
         # if no missing values, don't predict
@@ -534,6 +606,12 @@ class IterativeImputer(_BaseImputer):
         if is_categorical:
             # For categorical features, use classifier prediction
             imputed_values = estimator.predict(X_test)
+            # Ensure the imputed values are float to match X_filled dtype
+            imputed_values = imputed_values.astype(X_filled.dtype)
+            # Apply min/max clipping for categorical features too
+            imputed_values = np.clip(
+                imputed_values, self._min_value[feat_idx], self._max_value[feat_idx]
+            )
         else:
             # For numerical features, use existing logic
             if self.sample_posterior:
@@ -908,11 +986,15 @@ class IterativeImputer(_BaseImputer):
 
         # Check for sample_posterior with categorical features
         if self.sample_posterior and np.any(self._categorical_mask):
-            if self.n_nearest_features is not None:
-                raise NotImplementedError(
-                    "sample_posterior=True is not supported with categorical features "
-                    "when n_nearest_features is specified."
-                )
+            raise NotImplementedError(
+                "sample_posterior=True is not supported with categorical features."
+            )
+
+        # Check n_nearest_features with categorical features
+        if self.n_nearest_features is not None and np.any(self._categorical_mask):
+            raise NotImplementedError(
+                "n_nearest_features is not supported with categorical features."
+            )
 
         # Apply preprocessing if needed
         if self._preprocessor is not None:
@@ -934,7 +1016,8 @@ class IterativeImputer(_BaseImputer):
             self.n_iter_ = 0
             # Apply inverse transform if needed
             if self._preprocessor is not None:
-                # For categorical features, we need special handling during inverse transform
+                # For categorical features, we need special
+                # handling during inverse transform
                 Xt = self._inverse_transform_categorical(Xt)
             return super()._concatenate_indicator(Xt, X_indicator)
 
@@ -962,12 +1045,6 @@ class IterativeImputer(_BaseImputer):
 
         if not np.all(np.greater(self._max_value, self._min_value)):
             raise ValueError("One (or more) features have min_value >= max_value.")
-
-        # Check n_nearest_features with categorical features
-        if self.n_nearest_features is not None and np.any(self._categorical_mask):
-            raise NotImplementedError(
-                "n_nearest_features is not supported with categorical features."
-            )
 
         # order in which to impute
         # note this is probably too slow for large feature data (d > 100000)
