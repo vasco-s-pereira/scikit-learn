@@ -906,6 +906,12 @@ class IterativeImputer(_BaseImputer):
         self._categorical_mask = self._get_categorical_mask(X)
         self._preprocessor = self._setup_preprocessor(X)
 
+        # Check for sample_posterior with categorical features,
+        if self.sample_posterior and np.any(self._categorical_mask):
+            raise NotImplementedError(
+                "sample_posterior=True is not supported with categorical features."
+            )
+
         # Check for sample_posterior with categorical features
         if self.sample_posterior and np.any(self._categorical_mask):
             if self.n_nearest_features is not None:
